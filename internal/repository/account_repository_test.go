@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"errors"
 	"go-mysql-api/internal/models"
 	"testing"
 
@@ -150,9 +151,11 @@ func TestAccountsRepository_UpdateBalance(t *testing.T) {
 	defer db.Close()
 
 	a, _ := decimal.Parse("1099.99")
+	mock.ExpectBegin()
 	mock.ExpectExec("UPDATE balance SET amount = \\? WHERE id = \\?").
 		WithArgs(a, int64(1)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
 
 	repo := NewAccountRepository(db)
 
@@ -169,6 +172,43 @@ func TestAccountsRepository_UpdateBalance(t *testing.T) {
 		t.Fatalf("Update returned error: %v", err)
 	}
 
+}
+
+func TestAccountsRepository_ExchangeBalancesRollsBackWhenCreditUpdateFails(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("failed to open sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	fromAmount, _ := decimal.Parse("90")
+	toAmount, _ := decimal.Parse("17")
+	mock.ExpectBegin()
+	mock.ExpectExec("UPDATE balance SET amount = \\? WHERE id = \\?").
+		WithArgs(fromAmount, int64(1)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("UPDATE balance SET amount = \\? WHERE id = \\?").
+		WithArgs(toAmount, int64(2)).
+		WillReturnError(errors.New("credit update failed"))
+	mock.ExpectRollback()
+
+	repo := NewAccountRepository(db)
+	err = repo.ExchangeBalances(
+		context.Background(),
+		models.Account{ID: 1},
+		models.Balance{ID: 1},
+		fromAmount,
+		&models.Balance{ID: 2},
+		models.Currency{ID: 2},
+		toAmount,
+	)
+	if err == nil {
+		t.Fatal("expected credit update error")
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
 }
 
 func TestAccountsRepository_GetAccountByIban_NotFound(t *testing.T) {

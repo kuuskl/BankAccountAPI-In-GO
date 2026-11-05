@@ -23,6 +23,7 @@ type fakeAccountRepo struct {
 	exchangeRates []models.ExchangeRates
 	balances      []models.Balance
 	err           error
+	exchangeErr   error
 }
 
 func (f *fakeAccountRepo) Accounts(ctx context.Context) ([]models.Account, error) {
@@ -107,6 +108,42 @@ func (f *fakeAccountRepo) UpdateBalance(ctx context.Context, balance models.Bala
 	}
 
 	return errors.New("Balance found")
+}
+
+func (f *fakeAccountRepo) ExchangeBalances(ctx context.Context, account models.Account, fromBalance models.Balance, fromAmount decimal.Decimal, toBalance *models.Balance, toCurrency models.Currency, toAmount decimal.Decimal) error {
+	if f.exchangeErr != nil {
+		return f.exchangeErr
+	}
+	if f.err != nil {
+		return f.err
+	}
+
+	for i := range f.accounts {
+		if f.accounts[i].ID != account.ID {
+			continue
+		}
+		for j := range f.accounts[i].Balances {
+			if f.accounts[i].Balances[j].ID == fromBalance.ID {
+				f.accounts[i].Balances[j].Amount = fromAmount
+			}
+			if toBalance != nil && f.accounts[i].Balances[j].ID == toBalance.ID {
+				f.accounts[i].Balances[j].Amount = toAmount
+			}
+		}
+		if toBalance == nil {
+			newBalance := models.Balance{
+				ID:          int64(len(f.accounts[i].Balances) + 1),
+				Account_id:  account.ID,
+				Amount:      toAmount,
+				Currency_id: toCurrency.ID,
+				Currency:    toCurrency,
+			}
+			f.accounts[i].Balances = append(f.accounts[i].Balances, newBalance)
+		}
+		return nil
+	}
+
+	return errors.New("account not found")
 }
 
 func TestAccounts_Ok(t *testing.T) {
@@ -363,6 +400,28 @@ func TestExchangeCurrency_Ok(t *testing.T) {
 	if account.Balances[1].Amount != bNew {
 		t.Fatalf("USD balance has wrong amount, got %v", account.Balances[1].Amount)
 	}
+}
+
+func TestExchangeCurrency_UpdateFailureDoesNotChangeBalances(t *testing.T) {
+	repo := CreateRepoData()
+	repo.exchangeErr = errors.New("credit update failed")
+	h := NewAccountHandler(repo)
+
+	req := httptest.NewRequest(http.MethodPut, "/accounts/exchange/EE120000012345678901/EUR/USD/10", nil)
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("iban", "EE120000012345678901")
+	rctx.URLParams.Add("from", "EUR")
+	rctx.URLParams.Add("to", "USD")
+	rctx.URLParams.Add("amount", "10")
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+	rr := httptest.NewRecorder()
+
+	h.ExchangeCurrency(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("ExchangeCurrency expected status %d, got %d", http.StatusBadRequest, rr.Code)
+	}
+	ValidateBalanceNotChanged(repo, t)
 }
 
 func TestAddBalance_ZeroAmountFail(t *testing.T) {

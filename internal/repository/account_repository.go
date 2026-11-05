@@ -4,6 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"time"
 
 	"go-mysql-api/internal/models"
 
@@ -60,7 +64,13 @@ func (r *AccountRepository) GetAccountByIban(ctx context.Context, iban string) (
 }
 
 func (r *AccountRepository) UpdateBalance(ctx context.Context, balance models.Balance, amount decimal.Decimal) error {
-	result, err := r.db.ExecContext(
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	result, err := tx.ExecContext(
 		ctx,
 		"UPDATE balance SET amount = ? WHERE id = ?",
 		amount,
@@ -79,7 +89,53 @@ func (r *AccountRepository) UpdateBalance(ctx context.Context, balance models.Ba
 		return sql.ErrNoRows
 	}
 
-	return nil
+	err = logDebit()
+	if err != nil {
+		return fmt.Errorf("failed to log debit: %w", err)
+	}
+
+	return tx.Commit()
+}
+
+func (r *AccountRepository) ExchangeBalances(ctx context.Context, account models.Account, fromBalance models.Balance, fromAmount decimal.Decimal, toBalance *models.Balance, toCurrency models.Currency, toAmount decimal.Decimal) error {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	result, err := tx.ExecContext(ctx, "UPDATE balance SET amount = ? WHERE id = ?", fromAmount, fromBalance.ID)
+	if err != nil {
+		return err
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rowsAffected == 0 {
+		return sql.ErrNoRows
+	}
+
+	if toBalance != nil {
+		result, err = tx.ExecContext(ctx, "UPDATE balance SET amount = ? WHERE id = ?", toAmount, toBalance.ID)
+		if err != nil {
+			return err
+		}
+		rowsAffected, err = result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if rowsAffected == 0 {
+			return sql.ErrNoRows
+		}
+	} else {
+		_, err = tx.ExecContext(ctx, "INSERT INTO balance (account_id, amount, currency_id) VALUES (?, ?, ?)", account.ID, toAmount, toCurrency.ID)
+		if err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
 }
 
 func (r *AccountRepository) AddBalance(ctx context.Context, account models.Account, currency models.Currency, amount decimal.Decimal) error {
@@ -210,4 +266,26 @@ func (r *AccountRepository) ExchangeRates(ctx context.Context) ([]models.Exchang
 	}
 
 	return ms, rows.Err()
+}
+
+func logDebit() error {
+	client := &http.Client{Timeout: 10 * time.Second}
+
+	resp, err := client.Get("https://example.com")
+	if err != nil {
+		return err
+
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("received non-2xx response: %d", resp.StatusCode)
+	}
+
+	_, err = io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }

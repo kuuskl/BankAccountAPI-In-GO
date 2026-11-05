@@ -5,10 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"fmt"
-	"io"
 	"net/http"
-	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/govalues/decimal"
@@ -20,6 +17,7 @@ type AccountRepository interface {
 	Accounts(ctx context.Context) ([]models.Account, error)
 	GetAccountByIban(ctx context.Context, iban string) (models.Account, error)
 	UpdateBalance(ctx context.Context, balance models.Balance, amount decimal.Decimal) error
+	ExchangeBalances(ctx context.Context, account models.Account, fromBalance models.Balance, fromAmount decimal.Decimal, toBalance *models.Balance, toCurrency models.Currency, toAmount decimal.Decimal) error
 	AddBalance(ctx context.Context, account models.Account, currency models.Currency, amount decimal.Decimal) error
 	GetExchangeRate(ctx context.Context, fromCurrency int64, toCurrency int64) (models.ExchangeRates, error)
 	GetCurrencyByCurrencyCode(ctx context.Context, code string) (models.Currency, error)
@@ -134,7 +132,7 @@ func (h *AccountHandler) DebitFromBalance(w http.ResponseWriter, r *http.Request
 				return
 			}
 
-			if newAmount.Cmp(decimal.Decimal{}) <= 0 {
+			if newAmount.Cmp(decimal.Decimal{}) < 0 {
 				http.Error(w, "Account does not have enough currency on balance", http.StatusBadRequest)
 				return
 			}
@@ -142,11 +140,6 @@ func (h *AccountHandler) DebitFromBalance(w http.ResponseWriter, r *http.Request
 			err := h.repo.UpdateBalance(r.Context(), balance, newAmount)
 			if err != nil {
 				http.Error(w, "Error debiting from balance", http.StatusBadRequest)
-				return
-			}
-			err = logDebit()
-			if err != nil {
-				http.Error(w, "Error logging debit", http.StatusInternalServerError)
 				return
 			}
 			newBalance = false
@@ -204,61 +197,47 @@ func (h *AccountHandler) ExchangeCurrency(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	var fromBalanceExist bool = false
-	for _, fromBalance := range account.Balances {
-		if fromBalance.Currency.CurrencyCode == fromCurrency.CurrencyCode {
-
-			var newAmount decimal.Decimal
-			newAmount, err = fromBalance.Amount.Sub(amount)
-			if err != nil {
-				http.Error(w, "Error calculating new amount", http.StatusBadRequest)
-				return
-			}
-			if newAmount.Cmp(decimal.Decimal{}) <= 0 {
-				http.Error(w, "Account does not have enough currency on "+from+" balance", http.StatusBadRequest)
-				return
-			}
-
-			err := h.repo.UpdateBalance(r.Context(), fromBalance, newAmount)
-			if err != nil {
-				http.Error(w, "Error debiting from balance", http.StatusBadRequest)
-				return
-			}
-			fromBalanceExist = true
-
-			var newBalance bool = true
-			for _, toBalance := range account.Balances {
-				if toBalance.Currency.CurrencyCode == toCurrency.CurrencyCode {
-					var newAmount decimal.Decimal
-					newAmount, err = toBalance.Amount.Add(convertedAmount)
-					if err != nil {
-						http.Error(w, "Error calculating new amount", http.StatusBadRequest)
-						return
-					}
-					err := h.repo.UpdateBalance(r.Context(), toBalance, newAmount)
-					if err != nil {
-						http.Error(w, "Error adding to balance", http.StatusBadRequest)
-						return
-					}
-					newBalance = false
-				}
-			}
-
-			if newBalance {
-				err := h.repo.AddBalance(r.Context(), account, toCurrency, convertedAmount)
-				if err != nil {
-					http.Error(w, "Error adding balance", http.StatusBadRequest)
-					return
-				}
-			}
+	var fromBalance *models.Balance
+	for i := range account.Balances {
+		if account.Balances[i].Currency.CurrencyCode == fromCurrency.CurrencyCode {
+			fromBalance = &account.Balances[i]
+			break
 		}
 	}
 
-	if !fromBalanceExist {
+	if fromBalance == nil {
 		http.Error(w, "Account does not have "+from+" balance", http.StatusBadRequest)
 		return
 	}
 
+	newFromAmount, err := fromBalance.Amount.Sub(amount)
+	if err != nil {
+		http.Error(w, "Error calculating new amount", http.StatusBadRequest)
+		return
+	}
+	if newFromAmount.Cmp(decimal.Decimal{}) <= 0 {
+		http.Error(w, "Account does not have enough currency on "+from+" balance", http.StatusBadRequest)
+		return
+	}
+
+	var toBalance *models.Balance
+	var newToAmount = convertedAmount
+	for i := range account.Balances {
+		if account.Balances[i].Currency.CurrencyCode == toCurrency.CurrencyCode {
+			toBalance = &account.Balances[i]
+			newToAmount, err = account.Balances[i].Amount.Add(convertedAmount)
+			if err != nil {
+				http.Error(w, "Error calculating new amount", http.StatusBadRequest)
+				return
+			}
+			break
+		}
+	}
+
+	if err := h.repo.ExchangeBalances(r.Context(), account, *fromBalance, newFromAmount, toBalance, toCurrency, newToAmount); err != nil {
+		http.Error(w, "Error exchanging currency", http.StatusBadRequest)
+		return
+	}
 }
 
 func (h *AccountHandler) contextWithTimeout() (context.Context, context.CancelFunc) {
@@ -311,28 +290,6 @@ func (h *AccountHandler) ConvertFromTo(w http.ResponseWriter, r *http.Request, f
 		return decimal.Decimal{}, err
 	}
 	return toAmountReturn, nil
-}
-
-func logDebit() error {
-	client := &http.Client{Timeout: 10 * time.Second}
-
-	resp, err := client.Get("https://example.com")
-	if err != nil {
-		return err
-
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("received non-2xx response: %d", resp.StatusCode)
-	}
-
-	_, err = io.ReadAll(resp.Body)
-	if err != nil {
-		return err
-	}
-
-	return nil
 }
 
 /*  For data testing */
